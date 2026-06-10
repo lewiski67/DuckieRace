@@ -1,0 +1,5 @@
+<launch>
+    <include file="$(find vpa_robot_interface)/launch/vpa_imu.launch">
+    </include>
+    <node pkg="vpa_robot_interface" type="dead_reckoner_node.py" name="dead_reckoner_node" output="screen"/>
+</launch>

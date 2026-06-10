@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+import rospy
+from geometry_msgs.msg import Twist, Pose2D
+
+import socket
+from std_msgs.msg import Bool, Int32MultiArray
+
+from map.trajectory_waypoint import get_trajectory_waypoints
+import numpy as np
+from math import atan2, sin, cos, sqrt, pi
+
+skip_id = {(318, 333),(333, 312),(312, 316),(316,330),(330,318)} 
+# these are short distance that we dont need to follow trajectory
+# just resume lane following
+
+class TrajFollowingNode:
+    def __init__(self):
+        self.robot_name = socket.gethostname()
+        self.cmd_last = Twist()
+        self.cmd_pub = rospy.Publisher('cmd_vel_tf', Twist, queue_size=1)
+
+        self.current_pose = Pose2D()
+        rospy.Subscriber('dead_reckoned_pose', Pose2D, self.pose_callback)
+        self.start_id   = None
+        self.end_id     = None
+        self.traj       = []
+        self.free_follow_speed = rospy.get_param('~free_follow_speed', 0.3)
+        self.log_when_err = []
+        self.true_cmd = Twist()
+        self.true_cmd_sub = rospy.Subscriber('cmd_vel', Twist, self.true_cmd_callback)
+        rospy.Subscriber('start_end_id', Int32MultiArray, self.start_end_id_callback)
+        rospy.loginfo(f"{self.robot_name} Traj Following Node Initialized")
+        self.status_pub = rospy.Publisher('cur_traj_finished', Bool, queue_size=1)
+
+    def true_cmd_callback(self, msg):
+        self.true_cmd = msg
+
+    def pose_callback(self, msg):
+        self.current_pose = msg
+
+    def start_end_id_callback(self, msg):
+        self.start_id = msg.data[0]
+        self.end_id   = msg.data[1]
+        self.current_pose = Pose2D()  # reset current pose
+        self.traj = get_trajectory_waypoints(self.start_id, self.end_id)
+        pose_dd = rospy.wait_for_message('dead_reckoned_pose', Pose2D, timeout=1.0)
+        self.current_pose = pose_dd  # get the latest pose
+        self.log_when_err = [(self.current_pose.x, self.current_pose.y, self.current_pose.theta,0,0)]
+        
+        rospy.loginfo(f"{self.robot_name}: [TRAJ] Received new trajectory from {self.start_id} to {self.end_id} with {len(self.traj)} points.")
+
+        if (self.start_id, self.end_id) in skip_id:
+            rospy.loginfo(f"{self.robot_name}: [TRAJ] Skipping trajectory following for short distance from {self.start_id} to {self.end_id}.")
+            self.status_pub.publish(Bool(data=True))
+            return
+        self.follow_trajectory()
+
+    def follow_trajectory(self):
+        rate = rospy.Rate(10)  # 10 Hz
+        for pose_point in self.traj:
+            if rospy.is_shutdown():
+                break
+            x_ref, y_ref, theta_ref = pose_point
+            while not rospy.is_shutdown():
+                x_meas = self.current_pose.x
+                y_meas = self.current_pose.y
+                theta_meas = self.current_pose.theta
+
+                v_cmd, w_cmd, distance = self.compute_twist(x_meas, y_meas, theta_meas, x_ref, y_ref, theta_ref)
+                true_w_cmd = self.true_cmd.angular.z
+                self.log_when_err.append((x_meas,y_meas,theta_meas,true_w_cmd,w_cmd))
+                cmd = Twist()
+                cmd.linear.x = v_cmd
+                cmd.angular.z = w_cmd
+                self.cmd_pub.publish(cmd)
+                self.cmd_last = cmd
+
+                if distance < 0.05:  # 5 cm tolerance to switch to next point
+                    theta_err = atan2(sin(theta_ref - theta_meas), cos(theta_ref - theta_meas))
+                    if abs(theta_err) <= 15*pi/180 or v_cmd < 0.01:  # also check heading error within 15 degrees
+                        # we sometimes need to accept that it cant get there, so if car stop, we let go
+                        rospy.loginfo(f"{self.robot_name}: Reached waypoint ({x_ref}, {y_ref}, {theta_ref}). Current pose: ({x_meas}, {y_meas}, {theta_meas}).")
+                        break
+
+                elif v_cmd < 0.01:
+                    # this is stop for anoher reason, we need to break to avoid infinite loop
+                    rospy.loginfo(f"{self.robot_name}: Stopped before reaching waypoint ({x_ref}, {y_ref}, {theta_ref}). Current pose: ({x_meas}, {y_meas}, {theta_meas}).")
+                    print(self.log_when_err)
+                    break 
+
+                rate.sleep()
+
+        rospy.loginfo(f"{self.robot_name}: Current trajectory completed.")
+        self.status_pub.publish(Bool(data=True))
+        # now we finished the trajectory
+
+    def compute_twist(self, x_meas, y_meas, theta_meas, x_ref, y_ref, theta_ref):
+        # ---- fixed params for smooth turning ----
+        vf_ref      = self.free_follow_speed # max forward speed (m/s)
+        v_min_move  = 0.08          # minimum to overcome deadband (only when facing forward)
+        stop_enter  = 0.05          # stop radius (m)
+        near_scale  = 0.10          # start tapering v within this range (m)
+        K_ang       = 0.8           # small P on heading
+        w_max       = 2.5           # absolute cap on yaw rate (rad/s)
+        alpha_w     = 0.55          # 0..1; higher = snappier ω
+        theta_goal  = theta_ref     # desired final heading (rad)
+        theta_tol   = 15.0 * pi/180  # done when |theta_err| < 15°
+        wheel_base  = 0.10          # DB19 wheelbase (m)
+        a_max       = 0.5           # braking accel (m/s^2)
+        Ld_max      = 0.35          # max lookahead (m)
+        Ld_min      = 0.20          # min lookahead (m)
+
+        # keep filter state
+        if not hasattr(self, 'prev_w'):
+            self.prev_w = 0.0
+
+        # ---- geometry ----
+        dx = x_ref - x_meas
+        dy = y_ref - y_meas
+        distance = sqrt(dx*dx + dy*dy)
+        target_bearing = atan2(dy, dx)
+
+        def wrap(a): return atan2(sin(a), cos(a))
+        angle_err = wrap(target_bearing - theta_meas)
+
+        # ---- stop if at goal (then softly align heading) ----
+        if distance < stop_enter:
+            theta_err = wrap(theta_goal - theta_meas)
+            if abs(theta_err) <= theta_tol:
+                v_cmd, w_des = 0.0, 0.0
+            else:
+                v_cmd, w_des = 0.0, K_ang * theta_err
+
+            # filter & clamp ω with dynamic limit (prevents negative wheel speeds)
+            w_cmd = (1.0 - alpha_w) * self.prev_w + alpha_w * w_des
+            w_limit = min(w_max, 2.0 * max(v_cmd, 0.01) / wheel_base)
+            w_cmd = max(-w_limit, min(w_limit, w_cmd))
+            self.prev_w = w_cmd
+
+        # ---- move with smooth curvature (pure pursuit style) ----
+        # speed taper (don’t force v_min when close or facing away)
+        c = cos(angle_err)
+        taper = min(1.0, distance / max(near_scale, 1e-6))
+        v_cmd = vf_ref * taper * max(0.0, c)
+        if distance < 0.05 or c < 0.2:
+            if c < 0.2 and distance > 0.25:
+                # in this case we want to stop
+                rospy.logwarn_throttle(1.0, f'Facing away from target (cos={c:.2f}), rotating in place')
+                v_cmd = 0.08 # try correct
+                if angle_err < 0:
+                    w_cmd = -1.8
+                else:
+                    w_cmd = 1.8
+                self.prev_w = w_cmd
+                return v_cmd, w_cmd, distance
+            else:
+                v_cmd = 0
+        else:
+            v_cmd = max(v_min_move, v_cmd)
+
+        # braking profile to stop_enter
+        v_cmd = min(v_cmd, sqrt(max(0.0, 2.0 * a_max * (distance - stop_enter))))
+
+        # bounded curvature via lookahead
+        Ld = min(max(distance, Ld_min), Ld_max)     # 20–50 cm lookahead
+        kappa = 2.0 * sin(angle_err) / Ld
+        w_des = v_cmd * kappa + K_ang * angle_err
+
+        # filter & clamp ω; ensure wheels stay non-negative
+        w_cmd = (1.0 - alpha_w) * self.prev_w + alpha_w * w_des
+        w_limit = min(w_max, 2.0 * max(v_cmd, 0.01) / wheel_base)
+        w_cmd = max(-w_limit, min(w_limit, w_cmd))
+        self.prev_w = w_cmd
+
+        # info line
+        # rospy.loginfo_throttle(0.5, f'v_ref: {v_cmd:.3f}, w_ref: {w_cmd:.3f}, x_meas: {x_meas}, y_meas:{y_meas},theta_meas:{theta_meas}')
+
+        return v_cmd, w_cmd, distance
+
+if __name__ == '__main__':
+    rospy.init_node('traj_follow_node')
+    traj_follower = TrajFollowingNode()
+    rospy.spin()

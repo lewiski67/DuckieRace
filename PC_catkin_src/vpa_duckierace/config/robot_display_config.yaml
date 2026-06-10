@@ -1,0 +1,13 @@
+robots:
+  vivian:
+    display_name: ROBOT1
+    color: dark green
+  fiona:
+    display_name: ROBOT2
+    color: purple
+  # dorie:
+  #   display_name: ROBOT3
+  #   color: blue
+  # luna:
+  #   display_name: ROBOT4
+  #   color:white 

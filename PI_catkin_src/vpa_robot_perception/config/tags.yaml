@@ -1,0 +1,5 @@
+standalone_tags:
+  [
+    {id: 102, size: 0.075}  # id是tag编号，size是边长（米）
+  ]
+tag_bundles: []

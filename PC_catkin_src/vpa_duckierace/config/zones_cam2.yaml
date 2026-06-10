@@ -1,0 +1,34 @@
+camera_name: usb_cam_2
+image_topic: /usb_cam_2/image_raw
+has_finish_line: true
+merge_zones:
+- x_min: 948
+  x_max: 1070
+  y_min: 246
+  y_max: 645
+fuel_zone:
+  x_min: 503
+  x_max: 871
+  y_min: 197
+  y_max: 307
+charge_gate_zone:
+  x_min: 188
+  x_max: 322
+  y_min: 246
+  y_max: 380
+ignore_zones:
+- x_min: 909
+  x_max: 989
+  y_min: 208
+  y_max: 284
+- x_min: 468
+  x_max: 549
+  y_min: 161
+  y_max: 234
+- x_min: 832
+  x_max: 910
+  y_min: 182
+  y_max: 256
+finish_line:
+  x: 687
+  direction: left_to_right
