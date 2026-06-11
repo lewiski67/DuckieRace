@@ -1,14 +1,16 @@
 <launch>
   <!-- Start camera node -->
   <arg name="robot_name" value="$(env robot_name)"/>
-  <arg name="lane_kd" default="1.5" />
+  <arg name="lane_kd" default="0.4" />
   <group ns="$(arg robot_name)">
   <include file="$(find vpa_robot_interface)/launch/vpa_camera.launch" />
   <!-- Start motor driver node -->
   <include file="$(find vpa_robot_interface)/launch/vpa_traction_start.launch" />
+  <!-- Use PC-side virtual joystick for DuckieRace; do not start physical joy_node here.
   <node name="joy_node" pkg="joy" type="joy_node">
     <param name="dev" value="/dev/input/js0" />
-  </node>  
+  </node>
+  -->
   <!-- Start your line follower -->
   <node pkg="vpa_robot_operation" type="duckierace.py" name="dr_line_follower" output="screen" >
     <param name="kd" value="$(arg lane_kd)" />

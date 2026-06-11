@@ -21,7 +21,7 @@ class LineFollower:
         self.max_speed = 0.35
         self.min_speed = 0.2
 
-        self.kp = 5
+        self.kp = 3.0
         self.kd = rospy.get_param('~kd', 2.5)
         self.last_error = 0.0
         self.last_time = rospy.Time.now()
@@ -32,9 +32,7 @@ class LineFollower:
         self.red_mode_active = False
         self.red_line_last_seen = rospy.Time.now()
 
-        self.h_row_ratio = 0.6
-        self.sample_row_fracs = [0.52, 0.60, 0.68, 0.76]
-        self.min_line_pixels = 150
+        self.h_row_ratio = 0.76
         self.stop_in_fuel = False
         
         
@@ -169,16 +167,7 @@ class LineFollower:
 
     def image_callback(self, msg):
 
-        if self.tof_range < 0.1:
-            if not self.tof_warn:
-                rospy.logwarn("Obstacle detected very close! Stopping.")
-                self.tof_warn = True
-            self.publish_twist(0.0, 0.0)
-            return
-        else:
-            if self.tof_warn:
-                rospy.loginfo("Obstacle cleared. Resuming line following.")
-                self.tof_warn = False
+        # ToF obstacle stopping disabled for DuckieRace; the front ToF is unreliable on this car.
         if self.stop_in_fuel:
             self.publish_twist(0.0, 0.0)  # Ensure we stay stopped in fuel zone
             return
@@ -204,16 +193,11 @@ class LineFollower:
         # Detect line of target color
         mask = self.detector.get_mask(bgr, self.target_color)
         h, w = mask.shape
-        line_x_votes = []
-        for frac in self.sample_row_fracs:
-            y = int(h * frac)
-            y = np.clip(y, 0, h - 1)
-            line_row = mask[y, :]
-            indices = np.where(line_row > 0)[0]
-            if len(indices) >= self.min_line_pixels:
-                line_x_votes.append(int(np.mean(indices)))
+        y = int(h * self.h_row_ratio)
+        line_row = mask[y, :]
 
-        if len(line_x_votes) == 0:
+        indices = np.where(line_row > 0)[0]
+        if len(indices) == 0:
             if not self.lost_detect:
                 rospy.logwarn("No line detected!")
             self.lost_detect = True
@@ -222,7 +206,7 @@ class LineFollower:
 
             return
         self.lost_detect = False
-        avg_x = int(np.median(line_x_votes))
+        avg_x = int(np.mean(indices))
         center_x = w // 2
         error = (avg_x - center_x) / center_x
 
@@ -231,7 +215,7 @@ class LineFollower:
         derror = (error - self.last_error) / dt if dt > 0 else 0.0
 
         angular_speed = -self.kp * error - self.kd * derror
-        angular_speed = np.clip(angular_speed, -2, 2)
+        angular_speed = np.clip(angular_speed, -0.8, 0.8)
 
         self.last_error = error
         self.last_time = now

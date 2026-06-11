@@ -47,6 +47,7 @@ class CamZoneManager:
         self.fuel_zone = self.zone_config.get('fuel_zone', None)
         self.charge_gate_zone = self.zone_config.get('charge_gate_zone', None)  # NEW
         self.ignore_zones = self.zone_config.get('ignore_zones', [])  # NEW
+        self.tag_ground_offset = self.zone_config.get('tag_ground_offset', {'dx': 0.0, 'dy': 0.0})
 
         self.fuel_publishers = {}
         self.charge_gate_publishers = {}  # NEW
@@ -58,8 +59,8 @@ class CamZoneManager:
         self.lap_counts = {}
 
         for robot_name, tag_id in self.robot_tags.items():
-            self.fuel_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/in_fuel_zone", Bool, queue_size=1)
-            self.charge_gate_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/in_charge_gate_zone", Bool, queue_size=1)  # NEW
+            self.fuel_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/in_fuel_zone", Bool, queue_size=1)
+            self.charge_gate_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/in_charge_gate_zone", Bool, queue_size=1)  # NEW
             self.brake_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/local_brake", Bool, queue_size=1)
             self.lap_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/lap_count", Float32, queue_size=1)
             self.last_positions[tag_id] = None
@@ -96,7 +97,7 @@ class CamZoneManager:
                 tag_id = det.tag_id
                 if tag_id not in self.tag_to_robot:
                     continue
-                center = det.center
+                center = self.tag_ground_point(det)
 
                 if self.is_point_in_zone(center, zone):
                     inside_now.add(tag_id)
@@ -128,16 +129,18 @@ class CamZoneManager:
         # Fuel zone logic
         for det in detections:
             tag_id = det.tag_id
-            center = det.center
+            if tag_id not in self.tag_to_robot:
+                continue
+            center = self.tag_ground_point(det)
             if self.is_point_in_zone(center, self.fuel_zone):
                 current_in_fuel.add(tag_id)
                 if tag_id not in self.tags_in_fuel:
                     rospy.loginfo(f"Tag {tag_id} ENTERED FUEL zone")
-                    self.fuel_publishers[tag_id].publish(Bool(data=True))
             else:
                 if tag_id in self.tags_in_fuel:
                     rospy.loginfo(f"Tag {tag_id} EXITED FUEL zone")
-                    self.fuel_publishers[tag_id].publish(Bool(data=False))
+        for tag_id in self.fuel_publishers:
+            self.fuel_publishers[tag_id].publish(Bool(data=(tag_id in current_in_fuel)))
         self.tags_in_fuel = current_in_fuel
 
         # Charge gate zone logic (NEW)
@@ -145,21 +148,18 @@ class CamZoneManager:
         if self.charge_gate_zone:
             for det in detections:
                 tag_id = det.tag_id
-                center = det.center
+                if tag_id not in self.tag_to_robot:
+                    continue
+                center = self.tag_ground_point(det)
                 if self.is_point_in_zone(center, self.charge_gate_zone):
                     current_in_gate.add(tag_id)
                     if tag_id not in self.tags_in_charge_gate:
                         rospy.loginfo(f"Tag {tag_id} ENTERED CHARGE GATE")
-                        self.charge_gate_publishers[tag_id].publish(Bool(data=True))
                 else:
                     if tag_id in self.tags_in_charge_gate:
                         rospy.loginfo(f"Tag {tag_id} EXITED CHARGE GATE")
-                        self.charge_gate_publishers[tag_id].publish(Bool(data=False))
-        else:
-            # If zone not configured, force all false by clearing previous state
-            for tag_id in list(self.tags_in_charge_gate):
-                if tag_id in self.charge_gate_publishers:
-                    self.charge_gate_publishers[tag_id].publish(Bool(data=False))
+        for tag_id in self.charge_gate_publishers:
+            self.charge_gate_publishers[tag_id].publish(Bool(data=(tag_id in current_in_gate)))
 
         self.tags_in_charge_gate = current_in_gate
 
@@ -172,7 +172,7 @@ class CamZoneManager:
             for det in detections:
 
                 tag_id = det.tag_id
-                pos = det.center[axis_idx]
+                pos = self.tag_ground_point(det)[axis_idx]
                 last_pos = self.last_positions.get(tag_id)
                 last_lap_time = getattr(self, 'last_lap_time', {})
                 now_time = rospy.Time.now().to_sec()
@@ -198,8 +198,15 @@ class CamZoneManager:
     def is_point_in_zone(self, point, zone):
         x, y = point
         return zone['x_min'] <= x <= zone['x_max'] and zone['y_min'] <= y <= zone['y_max']
+
+    def tag_ground_point(self, det):
+        return np.array(det.center, float) + np.array([
+            float(self.tag_ground_offset.get('dx', 0.0)),
+            float(self.tag_ground_offset.get('dy', 0.0)),
+        ])
     def apply_ignore_mask(self, gray):
         """Black out configured ignore_zones before tag detection."""
+        return gray
         if not getattr(self, "ignore_zones", None):
             return gray
 
