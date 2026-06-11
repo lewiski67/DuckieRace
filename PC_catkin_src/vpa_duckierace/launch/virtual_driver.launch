@@ -37,7 +37,7 @@
   <arg name="driving_mode" default="conservative"
        doc="Behavior mode for all robots: manual|conservative|aggressive|cooperative|adaptive" />
   <arg name="control_rate" default="2.0"
-       doc="Control loop frequency [Hz]. Must be > 1/0.3 ~= 3.3 to match duckierace debounce." />
+       doc="Control loop frequency [Hz]. Keep <= 1/0.3 ~= 3.3 to match duckierace debounce." />
 
   <!-- Shared robot list (all four DuckieRace robots) -->
   <arg name="all_robots" default="[henry, fiona, dorie, luna]" />

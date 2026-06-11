@@ -58,6 +58,12 @@ class DrivingMode(Enum):
     ADAPTIVE     = "adaptive"
 
 
+class ChargeState(Enum):
+    IDLE      = "idle"
+    LOCKING   = "locking"
+    CHARGING  = "charging"
+
+
 # ---------------------------------------------------------------------------
 # Joy button indices (PS4 / generic gamepad - same as duckierace.py)
 # ---------------------------------------------------------------------------
@@ -124,6 +130,7 @@ class VirtualDriver:
         # Running estimate of the current speed step offset from SPEED_START.
         # +N means N * L1 presses sent, -N means N * R1 presses sent.
         self.speed_offset      = 0
+        self.charge_state      = ChargeState.IDLE
 
         # ---- Publishers -------------------------------------------------------
         self.joy_pub  = rospy.Publisher(
@@ -183,6 +190,7 @@ class VirtualDriver:
             # Game just stopped - reset so the next start performs brake release
             self.brake_released = False
             self.speed_offset   = 0
+            self.charge_state   = ChargeState.IDLE
         self.global_brake = msg.data
 
     def _cb_set_mode(self, msg: String):
@@ -199,6 +207,7 @@ class VirtualDriver:
             self.mode           = new_mode
             self.brake_released = False   # re-release brake on mode change
             self.speed_offset   = 0
+            self.charge_state   = ChargeState.IDLE
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Mode -> {self.mode.value}")
             self.mode_pub.publish(String(data=self.mode.value))
@@ -251,6 +260,43 @@ class VirtualDriver:
             self.speed_offset -= 1
         return buttons
 
+    def _should_start_charge(self) -> bool:
+        if not self.in_fuel_zone or self.power_level >= POWER_CHARGE_FULL:
+            return False
+
+        if self.mode == DrivingMode.CONSERVATIVE:
+            return True
+
+        if self.mode == DrivingMode.AGGRESSIVE:
+            return self.power_level < POWER_CRITICAL
+
+        if self.mode == DrivingMode.COOPERATIVE:
+            peers_not_critical = all(
+                p > COOP_CHARGE_PEER for p in self.other_power.values())
+            return (
+                self.power_level < COOP_CHARGE_SELF
+                and (peers_not_critical or self.power_level < POWER_CRITICAL))
+
+        if self.mode == DrivingMode.ADAPTIVE:
+            return self.power_level <= 60.0
+
+        return False
+
+    def _charge_control_msg(self) -> Joy:
+        if self.charge_state == ChargeState.LOCKING:
+            self.charge_state = ChargeState.CHARGING
+            rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Brake locked for charging")
+            return self._joy_press(BTN_X)
+
+        if self.charge_state == ChargeState.CHARGING:
+            if self.power_level >= POWER_CHARGE_FULL:
+                self.charge_state = ChargeState.IDLE
+                rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Charge complete, releasing brake")
+                return self._joy_press(BTN_B, BTN_X)
+            return self._joy_press(BTN_Y)
+
+        return self._make_joy()
+
     # ==========================================================================
     # Behavior implementations
     # ==========================================================================
@@ -269,10 +315,6 @@ class VirtualDriver:
         # Nudge speed toward minimum
         self._step_speed(STEPS_TO_MIN, buttons)
 
-        # Charge whenever possible
-        if self.in_fuel_zone and self.power_level < POWER_CHARGE_FULL:
-            buttons[BTN_Y] = 1
-
         return self._make_joy(buttons=buttons)
 
     def _decide_aggressive(self) -> Joy:
@@ -288,10 +330,6 @@ class VirtualDriver:
 
         # Nudge speed toward maximum
         self._step_speed(STEPS_TO_MAX, buttons)
-
-        # Emergency charging only
-        if self.in_fuel_zone and self.power_level < POWER_CRITICAL:
-            buttons[BTN_Y] = 1
 
         # Overtake: switch to yellow line when obstacle is dangerously close
         if self.tof_range < OVERTAKE_DIST:
@@ -318,18 +356,6 @@ class VirtualDriver:
         if self.tof_range < YIELD_DIST:
             buttons[BTN_B] = 1
 
-        # Cooperative charging decision
-        peers_not_critical = all(
-            p > COOP_CHARGE_PEER for p in self.other_power.values())
-        needs_charge = (
-            self.in_fuel_zone
-            and self.power_level < COOP_CHARGE_SELF
-            and self.power_level < POWER_CHARGE_FULL
-            and (peers_not_critical or self.power_level < POWER_CRITICAL))
-
-        if needs_charge:
-            buttons[BTN_Y] = 1
-
         return self._make_joy(buttons=buttons)
 
     def _decide_adaptive(self) -> Joy:
@@ -351,9 +377,6 @@ class VirtualDriver:
         if not self.in_fuel_zone:
             # Use yellow track; it often leads through the charging area
             buttons[BTN_B] = 1
-        # Charge the moment we arrive
-        if self.in_fuel_zone and self.power_level < POWER_CHARGE_FULL:
-            buttons[BTN_Y] = 1
         return self._make_joy(buttons=buttons)
 
     # ==========================================================================
@@ -377,6 +400,16 @@ class VirtualDriver:
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Brake released for '{self.mode.value}' mode")
             # Give duckierace.py one cycle (debounce window) before next command
+            return
+
+        # --- Stop in the fuel zone, charge, then release brake ----------------
+        if self.charge_state != ChargeState.IDLE:
+            self.joy_pub.publish(self._charge_control_msg())
+            return
+
+        if self._should_start_charge():
+            self.charge_state = ChargeState.LOCKING
+            self.joy_pub.publish(self._charge_control_msg())
             return
 
         # --- Normal behaviour ------------------------------------------------
