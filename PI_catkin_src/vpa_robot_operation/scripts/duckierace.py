@@ -33,6 +33,8 @@ class LineFollower:
         self.red_line_last_seen = rospy.Time.now()
 
         self.h_row_ratio = 0.6
+        self.sample_row_fracs = [0.52, 0.60, 0.68, 0.76]
+        self.min_line_pixels = 150
         self.stop_in_fuel = False
         
         
@@ -202,11 +204,16 @@ class LineFollower:
         # Detect line of target color
         mask = self.detector.get_mask(bgr, self.target_color)
         h, w = mask.shape
-        y = int(h * self.h_row_ratio)
-        line_row = mask[y, :]
+        line_x_votes = []
+        for frac in self.sample_row_fracs:
+            y = int(h * frac)
+            y = np.clip(y, 0, h - 1)
+            line_row = mask[y, :]
+            indices = np.where(line_row > 0)[0]
+            if len(indices) >= self.min_line_pixels:
+                line_x_votes.append(int(np.mean(indices)))
 
-        indices = np.where(line_row > 0)[0]
-        if len(indices) == 0:
+        if len(line_x_votes) == 0:
             if not self.lost_detect:
                 rospy.logwarn("No line detected!")
             self.lost_detect = True
@@ -215,7 +222,7 @@ class LineFollower:
 
             return
         self.lost_detect = False
-        avg_x = int(np.mean(indices))
+        avg_x = int(np.median(line_x_votes))
         center_x = w // 2
         error = (avg_x - center_x) / center_x
 

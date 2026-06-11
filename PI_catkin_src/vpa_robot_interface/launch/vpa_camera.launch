@@ -24,7 +24,7 @@
     <arg name="camera_info_url" default="file://$(find vpa_robot_interface)/config/camera_default.yaml"/>
     <arg name="robot_name" default="fiona"/>
     
-    <node name="robot_cam" pkg="usb_cam" type="usb_cam_node" output="screen" ns="$(arg robot_name)">
+    <node name="robot_cam" pkg="usb_cam" type="usb_cam_node" output="screen">
         <param name="video_device" value="/dev/video0" />
         <param name="image_width" value="$(arg width)" />
         <param name="image_height" value="$(arg height)" />
