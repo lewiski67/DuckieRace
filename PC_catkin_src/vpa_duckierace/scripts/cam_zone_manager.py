@@ -206,7 +206,6 @@ class CamZoneManager:
         ])
     def apply_ignore_mask(self, gray):
         """Black out configured ignore_zones before tag detection."""
-        return gray
         if not getattr(self, "ignore_zones", None):
             return gray
 

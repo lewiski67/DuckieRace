@@ -14,7 +14,9 @@ class ZoneStateAggregator:
             robot_tags = yaml.safe_load(f)
 
         self.camera_names = rospy.get_param("~camera_names", ["usb_cam_1", "usb_cam_2"])
+        self.fuel_hold_sec = float(rospy.get_param("~fuel_hold_sec", 0.5))
         self.states = {}
+        self.last_fuel_true = {}
         self.fuel_pubs = {}
         self.charge_gate_pubs = {}
 
@@ -23,6 +25,7 @@ class ZoneStateAggregator:
                 "fuel": {cam: False for cam in self.camera_names},
                 "charge_gate": {cam: False for cam in self.camera_names},
             }
+            self.last_fuel_true[robot_name] = None
             self.fuel_pubs[robot_name] = rospy.Publisher(
                 f"/{robot_name}/in_fuel_zone", Bool, queue_size=1
             )
@@ -52,7 +55,11 @@ class ZoneStateAggregator:
         def callback(msg):
             self.states[robot_name][field][camera_name] = bool(msg.data)
             if field == "fuel":
-                value = any(self.states[robot_name]["fuel"].values())
+                now = rospy.Time.now().to_sec()
+                if any(self.states[robot_name]["fuel"].values()):
+                    self.last_fuel_true[robot_name] = now
+                last_true = self.last_fuel_true[robot_name]
+                value = last_true is not None and (now - last_true) <= self.fuel_hold_sec
                 self.fuel_pubs[robot_name].publish(Bool(data=value))
             else:
                 value = any(self.states[robot_name]["charge_gate"].values())
