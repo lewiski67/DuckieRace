@@ -28,6 +28,12 @@ __pycache__/
 PC_catkin_src/**/.git/
 PI_catkin_src/**/.git/
 
+# Daisy-specific hardware mapping; keep local/remote patch out of shared sync
+DAISY_catkin_src/vpa_robot_interface/scripts/wheel_driver.py
+
+# Runtime robot display state, including initial battery levels
+PC_catkin_src/vpa_duckierace/config/robot_display_config.yaml
+
 # Local tooling metadata
 .agents/
 .codex/
