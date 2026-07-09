@@ -8,13 +8,13 @@ import cv2
 from cv_bridge import CvBridge
 
 robot_dict = {
-    2: 'vivian',
-    3: 'gina',
+    # 2: 'vivian',
+    # 3: 'gina',
     4: 'lucas',
-    5: 'daisy',
-    6: 'henry',
-    7: 'dorie',
-    8: 'luna',
+    # 5: 'daisy',
+    # 6: 'henry',
+    # 7: 'dorie',
+    # 8: 'luna',
     10: 'fiona'
 }
 

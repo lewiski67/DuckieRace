@@ -1,13 +1,17 @@
 robots:
-  vivian:
-    display_name: ROBOT1
-    color: dark green
   fiona:
+    display_name: ROBOT1
+    color: blue
+    initial_power: 75.0
+  lucas:
     display_name: ROBOT2
+    color: dark green
+    initial_power: 60.0
+  dorie:
+    display_name: ROBOT3
+    color: orange
+    initial_power: 45.0
+  daisy:
+    display_name: ROBOT4
     color: purple
-  # dorie:
-  #   display_name: ROBOT3
-  #   color: blue
-  # luna:
-  #   display_name: ROBOT4
-  #   color:white 
+    initial_power: 30.0

@@ -50,8 +50,9 @@ class CamZoneManager:
         self.tag_ground_offset = self.zone_config.get('tag_ground_offset', {'dx': 0.0, 'dy': 0.0})
 
         self.fuel_publishers = {}
+        self.merge_publishers = {}
         self.charge_gate_publishers = {}  # NEW
-        self.brake_publishers = {}
+        self.tag_visible_publishers = {}
         self.lap_publishers = {}
         self.tag_to_robot = {v: k for k, v in self.robot_tags.items()}
 
@@ -60,18 +61,31 @@ class CamZoneManager:
 
         for robot_name, tag_id in self.robot_tags.items():
             self.fuel_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/in_fuel_zone", Bool, queue_size=1)
+            self.merge_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/in_merge_zone", Bool, queue_size=1)
             self.charge_gate_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/in_charge_gate_zone", Bool, queue_size=1)  # NEW
-            self.brake_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/local_brake", Bool, queue_size=1)
+            self.tag_visible_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/tag_visible", Bool, queue_size=1)
             self.lap_publishers[tag_id] = rospy.Publisher(f"/{robot_name}/{self.cam_name}/lap_count", Float32, queue_size=1)
             self.last_positions[tag_id] = None
             self.lap_counts[tag_id] = 0.0
 
         self.merge_zone_status = [{'tag_ids': set(), 'entry_times': {}} for _ in self.merge_zones]
+        self.tags_in_merge = set()
         self.tags_in_fuel = set()
         self.tags_in_charge_gate = set()  # NEW
 
         self.image_sub = rospy.Subscriber(self.image_topic, Image, self.image_callback)
+        self.reset_laps_sub = rospy.Subscriber("/reset_laps", Bool, self.reset_laps_callback)
         rospy.loginfo(f"CamZoneManager for {self.cam_name} started")
+
+    def reset_laps_callback(self, msg):
+        if not msg.data:
+            return
+        for tag_id in self.lap_counts:
+            self.lap_counts[tag_id] = 0.0
+            self.last_positions[tag_id] = None
+            self.lap_publishers[tag_id].publish(Float32(data=0.0))
+        self.last_lap_time = {}
+        rospy.loginfo(f"Reset lap counts for {self.cam_name}")
 
     def image_callback(self, msg):
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -88,6 +102,9 @@ class CamZoneManager:
         detections = self.detector.detect(gray)
         now = rospy.Time.now().to_sec()
         current_in_fuel = set()
+        visible_tags = {det.tag_id for det in detections if det.tag_id in self.tag_to_robot}
+        for tag_id in self.tag_visible_publishers:
+            self.tag_visible_publishers[tag_id].publish(Bool(data=(tag_id in visible_tags)))
         
         for zone_idx, zone in enumerate(self.merge_zones):
             current_status = self.merge_zone_status[zone_idx]
@@ -112,19 +129,18 @@ class CamZoneManager:
             else:
                 first_tag = None
 
-            for tag_id in inside_now:
-                robot = self.tag_to_robot.get(tag_id)
-                if robot:
-                    self.brake_publishers[tag_id].publish(Bool(data=(tag_id != first_tag)))
-
             exited_tags = current_status['tag_ids'] - inside_now
             for tag_id in exited_tags:
-                robot = self.tag_to_robot.get(tag_id)
-                if robot:
-                    self.brake_publishers[tag_id].publish(Bool(data=False))
-                    current_status['entry_times'].pop(tag_id, None)
+                current_status['entry_times'].pop(tag_id, None)
 
             current_status['tag_ids'] = inside_now
+
+        current_in_merge = set()
+        for status in self.merge_zone_status:
+            current_in_merge.update(status['tag_ids'])
+        for tag_id in self.merge_publishers:
+            self.merge_publishers[tag_id].publish(Bool(data=(tag_id in current_in_merge)))
+        self.tags_in_merge = current_in_merge
 
         # Fuel zone logic
         for det in detections:
@@ -200,10 +216,7 @@ class CamZoneManager:
         return zone['x_min'] <= x <= zone['x_max'] and zone['y_min'] <= y <= zone['y_max']
 
     def tag_ground_point(self, det):
-        return np.array(det.center, float) + np.array([
-            float(self.tag_ground_offset.get('dx', 0.0)),
-            float(self.tag_ground_offset.get('dy', 0.0)),
-        ])
+        return np.array(det.center, float)
     def apply_ignore_mask(self, gray):
         """Black out configured ignore_zones before tag detection."""
         if not getattr(self, "ignore_zones", None):

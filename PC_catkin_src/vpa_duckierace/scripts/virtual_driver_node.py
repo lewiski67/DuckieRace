@@ -20,12 +20,16 @@ ROS Interface
 -------------
 Subscribed topics (all absolute paths):
   /{robot_name}/power_level        Float32  Virtual power level (0-100 %)
+  /{robot_name}/speed_percent      Float32  Robot-reported target speed
   /{robot_name}/local_brake        Bool     Current local brake state
   /{robot_name}/in_fuel_zone       Bool     Whether robot is in the fuel zone
   /{robot_name}/in_charge_gate_zone Bool    Whether robot is at charge-gate entry
+  /{robot_name}/in_merge_zone      Bool     Whether robot is in the merge zone
   /{robot_name}/front_range        Range    ToF distance to obstacle ahead
   /{robot_name}/set_driving_mode   String   Runtime mode-change command
   /{other_robot}/power_level       Float32  Peer robots' power (cooperative mode)
+  /{other_robot}/in_fuel_zone      Bool     Peer robots' fuel-zone occupancy
+  /{other_robot}/in_merge_zone     Bool     Peer robots' merge-zone occupancy
   /global_brake                    Bool     Race-level start / stop signal
 
 Published topics:
@@ -34,9 +38,9 @@ Published topics:
 
 Parameters
 ----------
-~robot_name    str    default 'henry'         Robot ROS namespace
+~robot_name    str    default 'fiona'         Robot ROS namespace
 ~driving_mode  str    default 'conservative'  Initial behavior mode
-~all_robots    list   default [henry,fiona,dorie,luna]
+~all_robots    list   default [fiona,lucas]
 ~control_rate  float  default 2.0             Control-loop frequency [Hz]
 """
 
@@ -65,10 +69,10 @@ class ChargeState(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Joy button indices (PS4 / generic gamepad - same as duckierace.py)
+# Joy button indices, matching robot-side duckierace.py.
 # ---------------------------------------------------------------------------
-BTN_B  = 1   # Yellow line / must hold to unlock brake inside fuel zone
-BTN_X  = 2   # Brake toggle
+BTN_X  = 0   # Brake toggle
+BTN_B  = 2   # Yellow line / must hold to unlock brake inside fuel zone
 BTN_Y  = 3   # Enable charging (while in fuel zone)
 BTN_L1 = 4   # Increase speed by one step
 BTN_R1 = 5   # Decrease speed by one step
@@ -83,6 +87,7 @@ STEPS_TO_MIN  = -int(round((SPEED_START - SPEED_MIN) / SPEED_STEP)) # -2
 
 # Power thresholds
 POWER_CRITICAL    = 15.0   # % - charge now regardless of mode
+CONSERVATIVE_CHARGE_START = 55.0  # % - conservative robot starts seeking charge below this
 POWER_CHARGE_FULL = 95.0   # % - stop charging above this
 COOP_CHARGE_SELF  = 50.0   # % - cooperative robot charges below this
 COOP_CHARGE_PEER  = 30.0   # % - cooperative robot yields if peer < this
@@ -90,6 +95,190 @@ COOP_CHARGE_PEER  = 30.0   # % - cooperative robot yields if peer < this
 # Obstacle distance [m]
 OVERTAKE_DIST = 0.30        # activate yellow line to pass slow robot ahead
 YIELD_DIST    = 0.25        # slow down (cooperative yield)
+BRAKE_CONFIRM_TICKS = 4     # control-loop ticks to wait for /local_brake feedback
+
+
+# ---------------------------------------------------------------------------
+# Strategy interfaces
+# ---------------------------------------------------------------------------
+
+class DriverActions:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def idle(self) -> Joy:
+        return self.driver._make_joy()
+
+    def press(self, *button_indices) -> Joy:
+        return self.driver._joy_press(*button_indices)
+
+    def release_brake(self) -> Joy:
+        return self.driver._brake_state_joy(False, "release brake")
+
+    def hold_yellow_line(self) -> Joy:
+        return self.driver._charge_gate_control_msg()
+
+    def wait_at_charge_gate(self) -> Joy:
+        return self.driver._charge_gate_wait_msg()
+
+    def wait_at_merge(self) -> Joy:
+        return self.driver._merge_wait_msg()
+
+    def release_from_merge(self):
+        return self.driver._merge_release_msg()
+
+    def charge(self, target_power: float, wait_for_merge: bool = True) -> Joy:
+        return self.driver._charge_control_msg(target_power, wait_for_merge)
+
+    def speed_step_msg(self, target_offset: int) -> Joy:
+        buttons = [0] * 12
+        self.driver._step_speed(target_offset, buttons)
+        return self.driver._make_joy(buttons=buttons)
+
+
+class DrivingStrategyBase:
+    def wants_charge(self, driver) -> bool:
+        return False
+
+    def charge_target_power(self, driver) -> float:
+        return POWER_CHARGE_FULL
+
+    def waits_for_fuel_occupancy(self, driver) -> bool:
+        return True
+
+    def waits_for_merge_occupancy(self, driver) -> bool:
+        return True
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        return actions.idle()
+
+    def decide(self, driver, actions: DriverActions) -> Joy:
+        if driver.charge_state != ChargeState.IDLE:
+            return actions.charge(
+                self.charge_target_power(driver),
+                self.waits_for_merge_occupancy(driver))
+
+        if driver.seeking_fuel:
+            active_gate_cameras = driver._active_charge_gate_cameras()
+            if active_gate_cameras:
+                driver.charge_target_cameras = active_gate_cameras
+            if driver.in_fuel_zone:
+                driver.seeking_fuel = False
+                driver.waiting_for_fuel = False
+                driver.charge_target_cameras = []
+            elif (not active_gate_cameras
+                    and driver.charge_target_cameras
+                    and self.waits_for_fuel_occupancy(driver)
+                    and driver._target_charge_fuel_occupied_by_other()):
+                driver.gate_release_sent = False
+                return actions.wait_at_charge_gate()
+            elif driver.waiting_for_fuel and driver.local_brake:
+                return actions.release_brake()
+            else:
+                driver.waiting_for_fuel = False
+                return actions.hold_yellow_line()
+
+        if driver.in_fuel_zone and self.wants_charge(driver):
+            driver.charge_state = ChargeState.LOCKING
+            return actions.charge(
+                self.charge_target_power(driver),
+                self.waits_for_merge_occupancy(driver))
+
+        if driver.in_fuel_zone:
+            if (self.waits_for_merge_occupancy(driver)
+                    and driver._merge_zone_occupied_by_other()):
+                driver.merge_release_sent = False
+                return actions.wait_at_merge()
+            if driver.waiting_for_merge:
+                joy_msg = actions.release_from_merge()
+                if joy_msg is not None:
+                    return joy_msg
+
+        if driver.leaving_charge:
+            if driver.in_merge_zone:
+                driver.leaving_charge = False
+            else:
+                return actions.hold_yellow_line()
+
+        if (self.wants_charge(driver)
+                and driver._active_charge_gate_cameras()
+                and not driver.in_fuel_zone):
+            driver.charge_target_cameras = driver._active_charge_gate_cameras()
+            if driver.local_brake:
+                driver.waiting_for_fuel = False
+                return actions.release_brake()
+            driver.waiting_for_fuel = False
+            driver.gate_release_sent = False
+            driver.seeking_fuel = True
+            return actions.hold_yellow_line()
+
+        driver.waiting_for_fuel = False
+        driver.gate_release_sent = False
+        return self.normal_drive(driver, actions)
+
+
+class ConservativeStrategy(DrivingStrategyBase):
+    def wants_charge(self, driver) -> bool:
+        return driver.power_level < CONSERVATIVE_CHARGE_START
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        return actions.speed_step_msg(STEPS_TO_MIN)
+
+
+class AggressiveStrategy(DrivingStrategyBase):
+    def wants_charge(self, driver) -> bool:
+        return driver.power_level < POWER_CRITICAL
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        buttons = [0] * 12
+        driver._step_speed(STEPS_TO_MAX, buttons)
+        if driver.tof_range < OVERTAKE_DIST:
+            buttons[BTN_B] = 1
+        return driver._make_joy(buttons=buttons)
+
+
+class CooperativeStrategy(DrivingStrategyBase):
+    def wants_charge(self, driver) -> bool:
+        peers_not_critical = all(
+            p > COOP_CHARGE_PEER for p in driver.other_power.values())
+        return (
+            driver.power_level < COOP_CHARGE_SELF
+            and (peers_not_critical or driver.power_level < POWER_CRITICAL))
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        buttons = [0] * 12
+        driver._step_speed(0, buttons)
+        if driver.tof_range < YIELD_DIST:
+            buttons[BTN_B] = 1
+        return driver._make_joy(buttons=buttons)
+
+
+class AdaptiveStrategy(DrivingStrategyBase):
+    def wants_charge(self, driver) -> bool:
+        return driver.power_level <= 60.0
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        if driver.power_level > 60.0:
+            joy = AggressiveStrategy().normal_drive(driver, actions)
+            if driver.in_fuel_zone and not driver.local_brake:
+                joy.buttons[BTN_B] = 1
+            return joy
+
+        if driver.power_level > 20.0:
+            return ConservativeStrategy().normal_drive(driver, actions)
+
+        buttons = [0] * 12
+        if driver.tag_visible:
+            buttons[BTN_B] = 1
+        return driver._make_joy(buttons=buttons)
+
+
+STRATEGIES = {
+    DrivingMode.CONSERVATIVE: ConservativeStrategy(),
+    DrivingMode.AGGRESSIVE: AggressiveStrategy(),
+    DrivingMode.COOPERATIVE: CooperativeStrategy(),
+    DrivingMode.ADAPTIVE: AdaptiveStrategy(),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +289,14 @@ class VirtualDriver:
     def __init__(self):
         rospy.init_node("virtual_driver_node")
 
-        self.robot_name  = rospy.get_param("~robot_name", "henry")
+        self.robot_name  = rospy.get_param("~robot_name", "fiona")
         mode_str         = rospy.get_param("~driving_mode", "conservative")
         all_robots       = rospy.get_param(
-            "~all_robots", ["henry", "fiona", "dorie", "luna"])
+            "~all_robots", ["fiona", "lucas"])
+        self.camera_names = rospy.get_param(
+            "~camera_names", ["usb_cam_1", "usb_cam_2"])
+        self.charge_camera_names = rospy.get_param(
+            "~charge_camera_names", ["usb_cam_2"])
         self.control_rate = float(rospy.get_param("~control_rate", 2.0))
 
         try:
@@ -120,17 +313,44 @@ class VirtualDriver:
         self.power_level       = 75.0
         self.in_fuel_zone      = False
         self.in_charge_gate    = False
+        self.in_merge_zone     = False
+        self.tag_visible       = False
+        self.local_brake       = True
+        self.local_brake_seq   = 0
         self.global_brake      = True    # True = game not running
         self.tof_range         = 9.9     # metres - default "clear"
+        self.current_speed     = SPEED_START
         self.other_power       = {r: 75.0 for r in self.other_robots}
+        self.other_in_fuel     = {r: False for r in self.other_robots}
+        self.other_in_merge    = {r: False for r in self.other_robots}
+        self.in_charge_gate_by_camera = {cam: False for cam in self.camera_names}
+        self.other_in_fuel_by_camera = {
+            r: {cam: False for cam in self.camera_names}
+            for r in self.other_robots
+        }
 
         # ---- Internal driver state -------------------------------------------
         # Have we already sent the one-shot brake-release Joy message?
         self.brake_released    = False
-        # Running estimate of the current speed step offset from SPEED_START.
+        self.brake_target      = None
+        self.brake_context     = ""
+        self.brake_sent        = False
+        self.brake_sent_seq    = 0
+        self.brake_wait_ticks  = 0
+        self.brake_retries     = 0
+        self.brake_fault       = False
+        # Current speed step offset, synchronised from /speed_percent when possible.
         # +N means N * L1 presses sent, -N means N * R1 presses sent.
         self.speed_offset      = 0
         self.charge_state      = ChargeState.IDLE
+        self.waiting_for_fuel  = False
+        self.gate_release_sent = False
+        self.charge_target_cameras = []
+        self.waiting_for_merge = False
+        self.merge_release_sent = False
+        self.seeking_fuel      = False
+        self.leaving_charge    = False
+        self.actions           = DriverActions(self)
 
         # ---- Publishers -------------------------------------------------------
         self.joy_pub  = rospy.Publisher(
@@ -141,12 +361,23 @@ class VirtualDriver:
         # ---- Subscribers ------------------------------------------------------
         rospy.Subscriber(f"/{self.robot_name}/power_level",
                          Float32, self._cb_power)
+        rospy.Subscriber(f"/{self.robot_name}/speed_percent",
+                         Float32, self._cb_speed)
         rospy.Subscriber(f"/{self.robot_name}/local_brake",
                          Bool,    self._cb_local_brake)
         rospy.Subscriber(f"/{self.robot_name}/in_fuel_zone",
                          Bool,    self._cb_fuel_zone)
         rospy.Subscriber(f"/{self.robot_name}/in_charge_gate_zone",
                          Bool,    self._cb_charge_gate)
+        rospy.Subscriber(f"/{self.robot_name}/in_merge_zone",
+                         Bool,    self._cb_merge)
+        for cam in self.camera_names:
+            rospy.Subscriber(
+                f"/{self.robot_name}/{cam}/in_charge_gate_zone",
+                Bool,
+                self._make_self_camera_cb(cam, "charge_gate"))
+        rospy.Subscriber(f"/{self.robot_name}/tag_visible",
+                         Bool,    self._cb_tag_visible)
         rospy.Subscriber(f"/{self.robot_name}/front_range",
                          Range,   self._cb_tof)
         rospy.Subscriber(f"/{self.robot_name}/set_driving_mode",
@@ -157,6 +388,14 @@ class VirtualDriver:
         for robot in self.other_robots:
             rospy.Subscriber(f"/{robot}/power_level", Float32,
                              self._make_power_cb(robot))
+            rospy.Subscriber(f"/{robot}/in_fuel_zone", Bool,
+                             self._make_fuel_cb(robot))
+            rospy.Subscriber(f"/{robot}/in_merge_zone", Bool,
+                             self._make_merge_cb(robot))
+            for cam in self.camera_names:
+                rospy.Subscriber(
+                    f"/{robot}/{cam}/in_fuel_zone", Bool,
+                    self._make_other_camera_fuel_cb(robot, cam))
 
         # ---- Control timer ----------------------------------------------------
         rospy.Timer(rospy.Duration(1.0 / self.control_rate), self._control_loop)
@@ -173,8 +412,14 @@ class VirtualDriver:
     def _cb_power(self, msg: Float32):
         self.power_level = msg.data
 
+    def _cb_speed(self, msg: Float32):
+        self.current_speed = msg.data
+        self.speed_offset = int(round(
+            (self.current_speed - SPEED_START) / SPEED_STEP))
+
     def _cb_local_brake(self, msg: Bool):
-        pass  # reserved for future closed-loop brake logic
+        self.local_brake = msg.data
+        self.local_brake_seq += 1
 
     def _cb_fuel_zone(self, msg: Bool):
         self.in_fuel_zone = msg.data
@@ -182,15 +427,38 @@ class VirtualDriver:
     def _cb_charge_gate(self, msg: Bool):
         self.in_charge_gate = msg.data
 
+    def _cb_merge(self, msg: Bool):
+        self.in_merge_zone = msg.data
+
+    def _make_self_camera_cb(self, camera_name: str, field: str):
+        def cb(msg: Bool):
+            if field == "charge_gate":
+                self.in_charge_gate_by_camera[camera_name] = msg.data
+        return cb
+
+    def _cb_tag_visible(self, msg: Bool):
+        self.tag_visible = msg.data
+
     def _cb_tof(self, msg: Range):
         self.tof_range = msg.range
 
     def _cb_global_brake(self, msg: Bool):
         if msg.data and not self.global_brake:
-            # Game just stopped - reset so the next start performs brake release
             self.brake_released = False
+            if not self.local_brake:
+                self._begin_brake_request(True, "game stop")
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.waiting_for_fuel = False
+            self.gate_release_sent = False
+            self.charge_target_cameras = []
+            self.waiting_for_merge = False
+            self.merge_release_sent = False
+            self.seeking_fuel = False
+            self.leaving_charge = False
+        elif not msg.data and self.global_brake:
+            self.brake_released = False
+            self._clear_brake_request()
         self.global_brake = msg.data
 
     def _cb_set_mode(self, msg: String):
@@ -206,8 +474,16 @@ class VirtualDriver:
         if new_mode != self.mode:
             self.mode           = new_mode
             self.brake_released = False   # re-release brake on mode change
+            self._clear_brake_request()
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.waiting_for_fuel = False
+            self.gate_release_sent = False
+            self.charge_target_cameras = []
+            self.waiting_for_merge = False
+            self.merge_release_sent = False
+            self.seeking_fuel = False
+            self.leaving_charge = False
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Mode -> {self.mode.value}")
             self.mode_pub.publish(String(data=self.mode.value))
@@ -215,6 +491,21 @@ class VirtualDriver:
     def _make_power_cb(self, name: str):
         def cb(msg: Float32):
             self.other_power[name] = msg.data
+        return cb
+
+    def _make_fuel_cb(self, name: str):
+        def cb(msg: Bool):
+            self.other_in_fuel[name] = msg.data
+        return cb
+
+    def _make_other_camera_fuel_cb(self, name: str, camera_name: str):
+        def cb(msg: Bool):
+            self.other_in_fuel_by_camera[name][camera_name] = msg.data
+        return cb
+
+    def _make_merge_cb(self, name: str):
+        def cb(msg: Bool):
+            self.other_in_merge[name] = msg.data
         return cb
 
     # ==========================================================================
@@ -237,6 +528,9 @@ class VirtualDriver:
                 buttons[idx] = 1
         return self._make_joy(buttons=buttons)
 
+    def _joy_has_subscribers(self) -> bool:
+        return self.joy_pub.get_num_connections() > 0
+
     def _release_brake_msg(self) -> Joy:
         """
         One-shot Joy message that releases the brake.
@@ -247,11 +541,76 @@ class VirtualDriver:
             return self._joy_press(BTN_X, BTN_B)
         return self._joy_press(BTN_X)
 
+    def _clear_brake_request(self):
+        self.brake_target = None
+        self.brake_context = ""
+        self.brake_sent = False
+        self.brake_sent_seq = 0
+        self.brake_wait_ticks = 0
+        self.brake_retries = 0
+        self.brake_fault = False
+
+    def _begin_brake_request(self, target: bool, context: str):
+        if self.brake_target == target and self.brake_context == context:
+            return
+        self.brake_target = target
+        self.brake_context = context
+        self.brake_sent = False
+        self.brake_sent_seq = self.local_brake_seq
+        self.brake_wait_ticks = 0
+        self.brake_retries = 0
+        self.brake_fault = False
+
+    def _brake_command_msg(self, target: bool) -> Joy:
+        if target:
+            return self._joy_press(BTN_X)
+        return self._release_brake_msg()
+
+    def _brake_state_step(self, target: bool, context: str):
+        if self.local_brake == target:
+            self._clear_brake_request()
+            return self._make_joy(), True
+
+        self._begin_brake_request(target, context)
+        if not self._joy_has_subscribers():
+            return self._make_joy(), False
+
+        if not self.brake_sent:
+            self.brake_sent = True
+            self.brake_sent_seq = self.local_brake_seq
+            self.brake_wait_ticks = 0
+            rospy.loginfo(
+                f"[VirtualDriver/{self.robot_name}] Request local_brake={target} ({context})")
+            return self._brake_command_msg(target), False
+
+        self.brake_wait_ticks += 1
+        if self.brake_wait_ticks < BRAKE_CONFIRM_TICKS:
+            return self._make_joy(), False
+
+        got_feedback = self.local_brake_seq > self.brake_sent_seq
+        if got_feedback:
+            self.brake_sent_seq = self.local_brake_seq
+        self.brake_retries += 1
+        self.brake_wait_ticks = 0
+        if got_feedback:
+            rospy.logwarn(
+                f"[VirtualDriver/{self.robot_name}] local_brake still {self.local_brake}; retry {self.brake_retries} for {context}")
+        else:
+            rospy.logwarn(
+                f"[VirtualDriver/{self.robot_name}] Brake request timed out waiting for local_brake={target}; retry {self.brake_retries} for {context}")
+        return self._brake_command_msg(target), False
+
+    def _brake_state_joy(self, target: bool, context: str) -> Joy:
+        joy_msg, _ = self._brake_state_step(target, context)
+        return joy_msg
+
     def _step_speed(self, target_offset: int, buttons: list) -> list:
         """
         Add ONE L1 or R1 press toward target_offset if not already there.
-        Modifies and returns buttons in-place; updates self.speed_offset.
+        Modifies and returns buttons in-place; syncs from robot-reported speed.
         """
+        self.speed_offset = int(round(
+            (self.current_speed - SPEED_START) / SPEED_STEP))
         if self.speed_offset < target_offset:
             buttons[BTN_L1]   = 1
             self.speed_offset += 1
@@ -260,124 +619,83 @@ class VirtualDriver:
             self.speed_offset -= 1
         return buttons
 
-    def _should_start_charge(self) -> bool:
-        if not self.in_fuel_zone or self.power_level >= POWER_CHARGE_FULL:
-            return False
+    def _active_charge_gate_cameras(self) -> list:
+        return [
+            cam for cam in self.charge_camera_names
+            if self.in_charge_gate_by_camera.get(cam, False)
+        ]
 
-        if self.mode == DrivingMode.CONSERVATIVE:
-            return True
-
-        if self.mode == DrivingMode.AGGRESSIVE:
-            return self.power_level < POWER_CRITICAL
-
-        if self.mode == DrivingMode.COOPERATIVE:
-            peers_not_critical = all(
-                p > COOP_CHARGE_PEER for p in self.other_power.values())
-            return (
-                self.power_level < COOP_CHARGE_SELF
-                and (peers_not_critical or self.power_level < POWER_CRITICAL))
-
-        if self.mode == DrivingMode.ADAPTIVE:
-            return self.power_level <= 60.0
-
+    def _active_charge_fuel_occupied_by_other(self) -> bool:
+        for cam in self._active_charge_gate_cameras():
+            for robot in self.other_robots:
+                if self.other_in_fuel_by_camera[robot].get(cam, False):
+                    return True
         return False
 
-    def _charge_control_msg(self) -> Joy:
+    def _target_charge_fuel_occupied_by_other(self) -> bool:
+        for cam in self.charge_target_cameras:
+            for robot in self.other_robots:
+                if self.other_in_fuel_by_camera[robot].get(cam, False):
+                    return True
+        return False
+
+    def _merge_zone_occupied_by_other(self) -> bool:
+        return any(self.other_in_merge.values())
+
+    def _charge_gate_control_msg(self) -> Joy:
+        return self._joy_press(BTN_B)
+
+    def _charge_gate_wait_msg(self) -> Joy:
+        if not self.local_brake:
+            self.waiting_for_fuel = True
+            return self._brake_state_joy(True, "charge gate wait")
+        self.waiting_for_fuel = True
+        return self._make_joy()
+
+    def _merge_wait_msg(self) -> Joy:
+        if not self.local_brake:
+            self.waiting_for_merge = True
+            return self._brake_state_joy(True, "merge wait")
+        self.waiting_for_merge = True
+        return self._make_joy()
+
+    def _merge_release_msg(self) -> Joy:
+        if self.local_brake:
+            joy_msg, done = self._brake_state_step(False, "merge release")
+            if not done:
+                return joy_msg
+        self.waiting_for_merge = False
+        self.merge_release_sent = False
+        return None
+
+    def _charge_control_msg(
+            self,
+            target_power: float = POWER_CHARGE_FULL,
+            wait_for_merge: bool = True) -> Joy:
         if self.charge_state == ChargeState.LOCKING:
+            joy_msg, done = self._brake_state_step(True, "charging lock")
+            if not done:
+                return joy_msg
             self.charge_state = ChargeState.CHARGING
-            rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Brake locked for charging")
-            return self._joy_press(BTN_X)
+            rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Brake confirmed for charging")
+            return self._joy_press(BTN_Y)
 
         if self.charge_state == ChargeState.CHARGING:
-            if self.power_level >= POWER_CHARGE_FULL:
+            if self.power_level >= target_power:
+                if wait_for_merge and self._merge_zone_occupied_by_other():
+                    return self._merge_wait_msg()
+                joy_msg, done = self._brake_state_step(False, "charging complete")
+                if not done:
+                    return joy_msg
                 self.charge_state = ChargeState.IDLE
-                rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Charge complete, releasing brake")
-                return self._joy_press(BTN_B, BTN_X)
+                self.waiting_for_merge = False
+                self.merge_release_sent = False
+                self.leaving_charge = True
+                rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Charge complete, brake release confirmed")
+                return self._charge_gate_control_msg()
             return self._joy_press(BTN_Y)
 
         return self._make_joy()
-
-    # ==========================================================================
-    # Behavior implementations
-    # ==========================================================================
-
-    def _decide_conservative(self) -> Joy:
-        """
-        Low speed, always charge while in the fuel zone.
-
-        Strategy rationale:
-        - Minimises power consumption (keeps speed at minimum).
-        - Recharges whenever an opportunity arises (fuel zone entry).
-        - Never takes risky overtake manoeuvres.
-        """
-        buttons = [0] * 12
-
-        # Nudge speed toward minimum
-        self._step_speed(STEPS_TO_MIN, buttons)
-
-        return self._make_joy(buttons=buttons)
-
-    def _decide_aggressive(self) -> Joy:
-        """
-        Max speed, charge only when critically low, overtake with yellow line.
-
-        Strategy rationale:
-        - Maximises lap throughput at the cost of higher power consumption.
-        - Accepts the risk of running out of charge in exchange for speed.
-        - Uses the yellow (alternative) track to pass slower robots.
-        """
-        buttons = [0] * 12
-
-        # Nudge speed toward maximum
-        self._step_speed(STEPS_TO_MAX, buttons)
-
-        # Overtake: switch to yellow line when obstacle is dangerously close
-        if self.tof_range < OVERTAKE_DIST:
-            buttons[BTN_B] = 1
-
-        return self._make_joy(buttons=buttons)
-
-    def _decide_cooperative(self) -> Joy:
-        """
-        Medium speed, fair fuel-zone sharing, yield at merge obstacles.
-
-        Strategy rationale:
-        - Yields (yellow line detour) when a robot is close to avoid blocking.
-        - Charges only when its own level is low AND peer robots are not
-          critically in need - preventing a "queue" at the charging spot.
-        - Keeps moderate speed to reduce risk of rear-end collisions.
-        """
-        buttons = [0] * 12
-
-        # Stay at default speed
-        self._step_speed(0, buttons)
-
-        # Yield when obstacle is ahead (cooperative merge behaviour)
-        if self.tof_range < YIELD_DIST:
-            buttons[BTN_B] = 1
-
-        return self._make_joy(buttons=buttons)
-
-    def _decide_adaptive(self) -> Joy:
-        """
-        Dynamically switches strategy based on current power level.
-
-        Power > 60 % -> aggressive (harvest laps while battery is good)
-        Power 20-60 % -> conservative (ease off, charge when possible)
-        Power < 20 % -> emergency rush (yellow line toward fuel zone)
-        """
-        if self.power_level > 60.0:
-            return self._decide_aggressive()
-
-        if self.power_level > 20.0:
-            return self._decide_conservative()
-
-        # Emergency: low power - navigate aggressively toward fuel zone
-        buttons = [0] * 12
-        if not self.in_fuel_zone:
-            # Use yellow track; it often leads through the charging area
-            buttons[BTN_B] = 1
-        return self._make_joy(buttons=buttons)
 
     # ==========================================================================
     # Main control loop (called by ROS timer at self.control_rate Hz)
@@ -390,40 +708,27 @@ class VirtualDriver:
 
         # Game not running: do nothing (brake already engaged by race GUI)
         if self.global_brake:
+            if not self.local_brake or self.brake_target is True:
+                self.joy_pub.publish(self._brake_state_joy(True, "game stop"))
             return
 
         # --- One-shot brake release at game start ----------------------------
         if not self.brake_released:
-            joy_msg = self._release_brake_msg()
+            joy_msg, done = self._brake_state_step(
+                False, f"{self.mode.value} start")
             self.joy_pub.publish(joy_msg)
-            self.brake_released = True
-            rospy.loginfo(
-                f"[VirtualDriver/{self.robot_name}] Brake released for '{self.mode.value}' mode")
+            if done:
+                rospy.loginfo(
+                    f"[VirtualDriver/{self.robot_name}] Brake release confirmed for '{self.mode.value}' mode")
+                self.brake_released = True
             # Give duckierace.py one cycle (debounce window) before next command
             return
 
-        # --- Stop in the fuel zone, charge, then release brake ----------------
-        if self.charge_state != ChargeState.IDLE:
-            self.joy_pub.publish(self._charge_control_msg())
+        strategy = STRATEGIES.get(self.mode)
+        if strategy is None:
             return
 
-        if self._should_start_charge():
-            self.charge_state = ChargeState.LOCKING
-            self.joy_pub.publish(self._charge_control_msg())
-            return
-
-        # --- Normal behaviour ------------------------------------------------
-        dispatch = {
-            DrivingMode.CONSERVATIVE: self._decide_conservative,
-            DrivingMode.AGGRESSIVE:   self._decide_aggressive,
-            DrivingMode.COOPERATIVE:  self._decide_cooperative,
-            DrivingMode.ADAPTIVE:     self._decide_adaptive,
-        }
-        decide_fn = dispatch.get(self.mode)
-        if decide_fn is None:
-            return
-
-        self.joy_pub.publish(decide_fn())
+        self.joy_pub.publish(strategy.decide(self, self.actions))
 
 
 # ---------------------------------------------------------------------------

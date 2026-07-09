@@ -172,7 +172,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--robots",
-        default="fiona,vivian,henry,dorie,luna",
+        default="fiona,lucas",
         help="Comma-separated robot namespaces. Number keys select this order.",
     )
     parser.add_argument("--hold-time", type=float, default=0.35)

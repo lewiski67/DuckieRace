@@ -84,6 +84,9 @@ REQUIRE_EXACTLY_3_TAGS = True
 
 # Preview plot (set False if running headless)
 SHOW_PLOT = True
+
+# Low-resolution snapshots can make tags too small for a single detector pass.
+DETECT_SCALES = (1.0, 2.0, 3.0)
 # =======================================================
 
 # -------- Detector selection --------
@@ -138,6 +141,30 @@ def _tag_cover_rect(corners: np.ndarray, img_w: int, img_h: int, pad: int):
     return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}
 
 
+def _detect_scaled(gray: np.ndarray, scale: float):
+    if scale == 1.0:
+        dets = detector.detect(gray)
+    else:
+        up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        dets = detector.detect(up)
+
+    out = []
+    for d in dets:
+        center = np.array(d.center, float) / scale
+        corners = np.array(d.corners, float) / scale
+        out.append((int(d.tag_id), center, corners))
+    return out
+
+
+def _gray_variants(gray: np.ndarray):
+    yield "gray", gray
+    yield "equalize", cv2.equalizeHist(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    yield "clahe", clahe.apply(gray)
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    yield "sharp", cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+
+
 def _detect_tags_with_covers(bgr: np.ndarray):
     """Detect tags and compute ignore_zones rectangles around EACH detected tag."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -145,22 +172,32 @@ def _detect_tags_with_covers(bgr: np.ndarray):
         k = BLUR_KERNEL if (BLUR_KERNEL % 2 == 1) else (BLUR_KERNEL + 1)
         gray = cv2.GaussianBlur(gray, (k, k), 0)
 
-    dets = detector.detect(gray)
+    attempts = []
+    dets = []
+    for variant_name, variant_gray in _gray_variants(gray):
+        for scale in DETECT_SCALES:
+            candidate = _detect_scaled(variant_gray, scale)
+            attempts.append(f"{variant_name}@{scale:g}x={len(candidate)}")
+            if len(candidate) == 3:
+                dets = candidate
+                break
+            if not REQUIRE_EXACTLY_3_TAGS and len(candidate) >= 3:
+                dets = candidate
+                break
+        if dets:
+            break
 
     if REQUIRE_EXACTLY_3_TAGS and (len(dets) != 3):
-        raise RuntimeError(f"Expected exactly 3 tags, got {len(dets)}")
+        raise RuntimeError(f"Expected exactly 3 tags; attempts: {', '.join(attempts)}")
 
     if len(dets) < 3:
-        raise RuntimeError(f"Expected at least 3 tags, got {len(dets)}")
+        raise RuntimeError(f"Expected at least 3 tags; attempts: {', '.join(attempts)}")
 
     out = []
     covers = []
     img_h, img_w = gray.shape[:2]
 
-    for d in dets:
-        tag_id = int(d.tag_id)
-        center = np.array(d.center, float)
-        corners = np.array(d.corners, float)
+    for tag_id, center, corners in dets:
         out.append((tag_id, center, corners))
         covers.append(_tag_cover_rect(corners, img_w=img_w, img_h=img_h, pad=COVER_PAD_PX))
 
